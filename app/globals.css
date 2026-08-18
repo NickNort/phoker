@@ -777,11 +777,16 @@ button:focus-visible {
   border-radius: 99px;
   background: white;
   opacity: 0.9;
+  transition: height 80ms linear;
 }
 
 .waveform.is-active span {
   animation: waveform 820ms ease-in-out infinite alternate;
   animation-delay: calc(var(--wave-index) * -110ms);
+}
+
+.waveform.is-live span {
+  animation: none;
 }
 
 .voice-copy {

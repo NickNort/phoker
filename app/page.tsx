@@ -56,12 +56,97 @@ declare global {
   interface Window {
     SpeechRecognition?: SpeechRecognitionConstructor;
     webkitSpeechRecognition?: SpeechRecognitionConstructor;
+    webkitAudioContext?: typeof AudioContext;
   }
 }
 
 const VAPI_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPI_PUBLIC_KEY ?? "";
 const VAPI_ASSISTANT_ID = process.env.NEXT_PUBLIC_VAPI_ASSISTANT_ID ?? "";
 const VAPI_CONFIGURED = Boolean(VAPI_PUBLIC_KEY && VAPI_ASSISTANT_ID);
+
+const MIC_CONSTRAINTS: MediaStreamConstraints = {
+  audio: {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+  },
+  video: false,
+};
+
+async function openMicrophone(): Promise<MediaStream> {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error("Microphone APIs are not available in this browser.");
+  }
+
+  try {
+    return await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "OverconstrainedError") {
+      return navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    }
+    throw error;
+  }
+}
+
+function setTracksEnabled(tracks: Array<MediaStreamTrack | null | undefined>, enabled: boolean) {
+  for (const track of tracks) {
+    if (track && track.readyState === "live") track.enabled = enabled;
+  }
+}
+
+function startMicMonitor(
+  stream: MediaStream,
+  onLevel: (level: number) => void,
+  existingContext?: AudioContext | null,
+): () => void {
+  const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
+  const context = existingContext ?? (AudioContextCtor ? new AudioContextCtor() : null);
+  if (!context) {
+    return () => undefined;
+  }
+
+  const source = context.createMediaStreamSource(stream);
+  const analyser = context.createAnalyser();
+  analyser.fftSize = 256;
+  analyser.smoothingTimeConstant = 0.72;
+  source.connect(analyser);
+
+  const samples = new Uint8Array(analyser.fftSize);
+  let frame = 0;
+  let stopped = false;
+  let lastPublish = 0;
+  let lastLevel = 0;
+
+  const tick = () => {
+    if (stopped) return;
+    analyser.getByteTimeDomainData(samples);
+    let sum = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = samples[index] ?? 128;
+      const value = (sample - 128) / 128;
+      sum += value * value;
+    }
+    const level = Math.min(1, Math.sqrt(sum / samples.length) * 4.25);
+    const now = performance.now();
+    if (now - lastPublish > 50 || Math.abs(level - lastLevel) > 0.04) {
+      lastPublish = now;
+      lastLevel = level;
+      onLevel(level);
+    }
+    frame = window.requestAnimationFrame(tick);
+  };
+
+  void context.resume().then(() => {
+    if (!stopped) tick();
+  });
+
+  return () => {
+    stopped = true;
+    window.cancelAnimationFrame(frame);
+    source.disconnect();
+    if (!existingContext) void context.close();
+  };
+}
 
 const card = (rank: Rank, suit: Suit): Card => ({ rank, suit });
 
@@ -202,11 +287,23 @@ function PlayingCard({
   );
 }
 
-function Waveform({ active }: { active: boolean }) {
+function Waveform({ active, level }: { active: boolean; level: number }) {
+  const bars = [0.38, 0.72, 1, 0.72, 0.38];
+
   return (
-    <span className={`waveform${active ? " is-active" : ""}`} aria-hidden="true">
-      {[0, 1, 2, 3, 4].map((bar) => (
-        <span key={bar} style={{ "--wave-index": bar } as React.CSSProperties} />
+    <span className={`waveform${active ? " is-live" : ""}`} aria-hidden="true">
+      {bars.map((weight, bar) => (
+        <span
+          key={bar}
+          style={
+            {
+              "--wave-index": bar,
+              height: active
+                ? `${Math.max(4, Math.round(4 + level * weight * 16))}px`
+                : undefined,
+            } as React.CSSProperties
+          }
+        />
       ))}
     </span>
   );
@@ -229,9 +326,15 @@ export default function Home() {
   const [voiceProvider, setVoiceProvider] = useState<"vapi" | "browser" | "demo">(
     VAPI_CONFIGURED ? "vapi" : "demo",
   );
+  const [micLevel, setMicLevel] = useState(0);
+  const [micReady, setMicReady] = useState(false);
 
   const vapiRef = useRef<Vapi | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const vapiInputTrackRef = useRef<MediaStreamTrack | null>(null);
+  const stopMicMonitorRef = useRef<(() => void) | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const callActiveRef = useRef(false);
   const dealerSpeakingRef = useRef(false);
   const mutedRef = useRef(false);
@@ -380,20 +483,38 @@ export default function Home() {
     commandHandlerRef.current = applyVoiceCommand;
   }, [applyVoiceCommand]);
 
-  const startBrowserVoice = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices?.getUserMedia({ audio: true });
-      stream?.getTracks().forEach((track) => track.stop());
-    } catch {
-      // SpeechRecognition may still present its own permission prompt.
-    }
+  const setMicrophoneMuted = useCallback((nextMuted: boolean) => {
+    setTracksEnabled(
+      [
+        ...(mediaStreamRef.current?.getAudioTracks() ?? []),
+        vapiInputTrackRef.current,
+      ],
+      !nextMuted,
+    );
+    vapiRef.current?.setMuted(nextMuted);
+    if (nextMuted) setMicLevel(0);
+  }, []);
 
+  const releaseMicrophone = useCallback(() => {
+    stopMicMonitorRef.current?.();
+    stopMicMonitorRef.current = null;
+    vapiInputTrackRef.current?.stop();
+    vapiInputTrackRef.current = null;
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    void audioContextRef.current?.close();
+    audioContextRef.current = null;
+    setMicReady(false);
+    setMicLevel(0);
+  }, []);
+
+  const startBrowserVoice = useCallback(() => {
     const Recognition =
       window.SpeechRecognition ?? window.webkitSpeechRecognition;
     if (!Recognition) {
       setVoiceProvider("demo");
-      setVoiceMode("unavailable");
-      return;
+      setVoiceMode(mediaStreamRef.current ? "listening" : "unavailable");
+      return false;
     }
 
     const recognition = new Recognition();
@@ -422,45 +543,69 @@ export default function Home() {
     recognition.onend = restartBrowserRecognition;
     recognitionRef.current = recognition;
     setVoiceProvider("browser");
+    setVoiceMode(mutedRef.current ? "muted" : "listening");
     restartBrowserRecognition();
+    return true;
   }, [restartBrowserRecognition]);
 
-  const connectVapi = useCallback(async () => {
-    if (!VAPI_CONFIGURED) return false;
+  const connectVapi = useCallback(
+    async (audioTrack: MediaStreamTrack) => {
+      if (!VAPI_CONFIGURED) return false;
 
-    try {
-      const vapi = new Vapi(VAPI_PUBLIC_KEY);
-      vapi.on("call-start", () => {
-        setVoiceMode("listening");
-        setVoiceProvider("vapi");
-      });
-      vapi.on("speech-start", () => {
-        dealerSpeakingRef.current = true;
-        setVoiceMode("dealer-speaking");
-      });
-      vapi.on("speech-end", finishDealerSpeech);
-      vapi.on("message", (message) => {
-        if (
-          message?.type === "transcript" &&
-          message?.role === "user" &&
-          (message?.transcriptType === "final" || message?.isFinal === true)
-        ) {
-          commandHandlerRef.current(String(message.transcript ?? ""));
+      try {
+        const vapi = new Vapi(
+          VAPI_PUBLIC_KEY,
+          undefined,
+          { alwaysIncludeMicInPermissionPrompt: true },
+          { audioSource: audioTrack, startAudioOff: false },
+        );
+        vapi.on("call-start", () => {
+          setVoiceMode(mutedRef.current ? "muted" : "listening");
+          setVoiceProvider("vapi");
+        });
+        vapi.on("call-start-failed", () => {
+          setVoiceProvider("demo");
+        });
+        vapi.on("speech-start", () => {
+          dealerSpeakingRef.current = true;
+          setVoiceMode("dealer-speaking");
+        });
+        vapi.on("speech-end", finishDealerSpeech);
+        vapi.on("message", (message) => {
+          if (message?.type !== "transcript" || message?.role !== "user") return;
+          const transcript = String(message.transcript ?? "").trim();
+          if (!transcript) return;
+          const isFinal =
+            message.transcriptType === "final" || message.isFinal === true;
+          if (isFinal) {
+            commandHandlerRef.current(transcript);
+          } else {
+            setHeardText(transcript);
+          }
+        });
+        vapi.on("error", () => {
+          setVoiceProvider((current) => (current === "vapi" ? current : "demo"));
+        });
+        vapiRef.current = vapi;
+        const call = await vapi.start(VAPI_ASSISTANT_ID);
+        if (!call) throw new Error("Vapi did not start a web call.");
+        try {
+          await vapi.setInputDevicesAsync({ audioSource: audioTrack });
+        } catch {
+          // Daily already has the pre-acquired track from createCallObject.
         }
-      });
-      vapi.on("error", () => {
+        void vapi.startLocalAudioLevelObserver(80);
+        return true;
+      } catch {
+        vapiRef.current?.removeAllListeners();
+        void vapiRef.current?.stop();
+        vapiRef.current = null;
         setVoiceProvider("demo");
-      });
-      vapiRef.current = vapi;
-      await vapi.start(VAPI_ASSISTANT_ID);
-      return true;
-    } catch {
-      vapiRef.current?.removeAllListeners();
-      vapiRef.current = null;
-      setVoiceProvider("demo");
-      return false;
-    }
-  }, [finishDealerSpeech]);
+        return false;
+      }
+    },
+    [finishDealerSpeech],
+  );
 
   const revealControls = useCallback(() => {
     setControlsVisible(true);
@@ -475,18 +620,70 @@ export default function Home() {
     setCallStage("connecting");
     setVoiceMode("connecting");
     callActiveRef.current = true;
+    mutedRef.current = false;
+    setMuted(false);
 
-    const connectedToVapi = await connectVapi();
-    if (!connectedToVapi) await startBrowserVoice();
+    const AudioContextCtor = window.AudioContext ?? window.webkitAudioContext;
+    const audioContext = AudioContextCtor ? new AudioContextCtor() : null;
+    audioContextRef.current = audioContext;
+    void audioContext?.resume();
+
+    let stream: MediaStream | null = null;
+    try {
+      stream = await openMicrophone();
+    } catch {
+      stream = null;
+      void audioContext?.close();
+      audioContextRef.current = null;
+    }
+
+    if (!callActiveRef.current) {
+      stream?.getTracks().forEach((track) => track.stop());
+      void audioContext?.close();
+      audioContextRef.current = null;
+      return;
+    }
+
+    if (stream) {
+      mediaStreamRef.current = stream;
+      setMicReady(true);
+
+      const liveTrack = stream.getAudioTracks()[0];
+      const vapiTrack = liveTrack?.clone() ?? null;
+      vapiInputTrackRef.current = vapiTrack;
+      stopMicMonitorRef.current = startMicMonitor(stream, setMicLevel, audioContext);
+
+      if (vapiTrack) {
+        const connectedToVapi = await connectVapi(vapiTrack);
+        if (!connectedToVapi) {
+          vapiTrack.stop();
+          vapiInputTrackRef.current = null;
+          startBrowserVoice();
+        }
+      } else {
+        startBrowserVoice();
+      }
+    } else {
+      setMicReady(false);
+      setVoiceMode("unavailable");
+      setVoiceProvider("demo");
+    }
+
+    if (!callActiveRef.current) {
+      releaseMicrophone();
+      return;
+    }
 
     setCallStage("active");
+    if (stream) setVoiceMode(mutedRef.current ? "muted" : "listening");
     revealControls();
     window.setTimeout(() => {
+      if (!callActiveRef.current) return;
       speakDealer(
         "Welcome to Midnight. Ten credits are on the table. You have sixteen. Say hit, stand, or double.",
       );
     }, 520);
-  }, [connectVapi, revealControls, speakDealer, startBrowserVoice]);
+  }, [connectVapi, releaseMicrophone, revealControls, speakDealer, startBrowserVoice]);
 
   const endCall = useCallback(async () => {
     callActiveRef.current = false;
@@ -502,24 +699,25 @@ export default function Home() {
       vapi.removeAllListeners();
       await vapi.stop();
     }
+    releaseMicrophone();
 
     setCallStage("ended");
-  }, []);
+  }, [releaseMicrophone]);
 
   const toggleMute = useCallback(() => {
     const nextMuted = !mutedRef.current;
     mutedRef.current = nextMuted;
     setMuted(nextMuted);
-    vapiRef.current?.setMuted(nextMuted);
+    setMicrophoneMuted(nextMuted);
     if (nextMuted) {
       recognitionRef.current?.stop();
       setVoiceMode("muted");
     } else {
-      setVoiceMode("listening");
+      setVoiceMode(mediaStreamRef.current ? "listening" : "unavailable");
       restartBrowserRecognition();
     }
     revealControls();
-  }, [restartBrowserRecognition, revealControls]);
+  }, [restartBrowserRecognition, revealControls, setMicrophoneMuted]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -545,6 +743,10 @@ export default function Home() {
       recognitionRef.current?.stop();
       window.speechSynthesis?.cancel();
       void vapiRef.current?.stop();
+      stopMicMonitorRef.current?.();
+      vapiInputTrackRef.current?.stop();
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      void audioContextRef.current?.close();
     },
     [],
   );
@@ -560,12 +762,21 @@ export default function Home() {
       : `Say ${actions.map((action) => `“${action}”`).join(", ")}`;
   const statusCopy = useMemo(() => {
     if (voiceMode === "dealer-speaking") return "Mina is speaking";
-    if (voiceMode === "listening") return "Listening";
+    if (voiceMode === "listening") return micReady ? "Listening to your mic" : "Listening";
     if (voiceMode === "processing") return "Reading the table";
     if (voiceMode === "muted") return "Microphone muted";
-    if (voiceMode === "unavailable") return "Demo voice unavailable";
-    return "Connecting voice";
-  }, [voiceMode]);
+    if (voiceMode === "unavailable") return "Microphone unavailable";
+    return "Connecting microphone";
+  }, [micReady, voiceMode]);
+
+  const providerCopy =
+    voiceProvider === "vapi"
+      ? "VAPI · LIVE MIC"
+      : voiceProvider === "browser"
+        ? "MIC · BROWSER STT"
+        : micReady
+          ? "MIC · LIVE"
+          : "DEMO · NO MIC";
 
   if (callStage === "incoming" || callStage === "connecting") {
     return (
@@ -608,7 +819,7 @@ export default function Home() {
               <span className="phone-glyph" aria-hidden="true">☎</span>
               <span>{callStage === "connecting" ? "Joining…" : "Answer"}</span>
             </button>
-            <span className="permission-note">Microphone access is requested once</span>
+            <span className="permission-note">Answer uses your microphone for hit, stand, and double</span>
           </div>
         </section>
         <p className="desktop-hint">Photon mini-app demo · Best viewed on iPhone</p>
@@ -645,6 +856,10 @@ export default function Home() {
                 setCallStage("incoming");
                 setDealerCaption("Ready when you are. Your first hand is waiting.");
                 setHeardText("");
+                setMicReady(false);
+                setMicLevel(0);
+                setMuted(false);
+                mutedRef.current = false;
               }}
             >
               Return to invite
@@ -753,12 +968,17 @@ export default function Home() {
 
         <div className="voice-tray">
           <div className={`voice-orb mode-${voiceMode}`}>
-            <Waveform active={voiceMode === "listening" || voiceMode === "dealer-speaking"} />
+            <Waveform
+              active={
+                (voiceMode === "listening" || voiceMode === "dealer-speaking") && !muted
+              }
+              level={muted ? 0 : micLevel}
+            />
           </div>
           <div className="voice-copy">
             <div className="voice-status-row">
               <strong>{statusCopy}</strong>
-              <span>{voiceProvider === "vapi" ? "VAPI · ELEVENLABS" : "DEMO · VAPI READY"}</span>
+              <span>{providerCopy}</span>
             </div>
             <p>{heardText ? `“${titleCase(heardText)}”` : availableCopy}</p>
           </div>
