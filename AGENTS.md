@@ -1,18 +1,21 @@
 # phoker — agent instructions
 
-This is a [Spectrum](https://photon.codes/docs/spectrum-ts) app, pinned to `spectrum-ts@^12.7.0`. The entry point is `src/index.ts`, which configures the imessage provider(s) and runs the echo loop.
+This is a [Spectrum](https://photon.codes/docs/spectrum-ts) app, pinned to `spectrum-ts@^12.7.0`. The entry point is `src/index.ts`, which configures the iMessage provider and sends a live Midnight blackjack mini-app card. The table UI lives in `app/` (vinext/Next).
 
 ## Working in this project
 
-- Run the app with `pnpm start`.
+- Run the iMessage bot with `pnpm start` or `pnpm dev`.
+- Run the blackjack mini-app with `pnpm dev:web`.
 - Add providers by importing them in `src/index.ts` and listing them in the `Spectrum({ providers: [...] })` config.
-- Outgoing message content uses the builders documented in the skill (text, attachment, voice, contact, richlink, poll, group, custom).
+- Outgoing message content uses the builders documented in the skill (text, attachment, voice, contact, richlink, app, poll, group, custom). iMessage invites use `app(GAME_URL, { live: true })`.
 
 ## Environment
 
 This project reads secrets from `.env` (gitignored). **Do not read, write, or echo `.env`** — it contains credentials.
 
 If startup fails with an authentication error, tell the user to verify their `PROJECT_ID` / `PROJECT_SECRET` at the [Photon dashboard](https://app.photon.codes).
+
+`GAME_URL` is the public origin of the blackjack mini-app sent as the iMessage card. `NEXT_PUBLIC_VAPI_*` is optional browser-side voice config for the table.
 
 ## Spectrum SDK reference
 
