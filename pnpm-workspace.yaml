@@ -1,3 +1,9 @@
+packages:
+  - "."
 allowBuilds:
   esbuild: true
   protobufjs: true
+  sharp: true
+  workerd: true
+minimumReleaseAgeExclude:
+  - '@vapi-ai/web@2.6.3'
