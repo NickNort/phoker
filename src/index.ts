@@ -1,12 +1,13 @@
-import { Spectrum } from "spectrum-ts";
+import { Spectrum, app } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 // Spectrum bridges a single agent loop to many messaging interfaces.
 // Each provider in `providers` adds an interface (terminal TUI, iMessage, …).
 // Docs: https://photon.codes/docs/spectrum-ts
 const projectId = process.env.PROJECT_ID!;
 const projectSecret = process.env.PROJECT_SECRET!;
+const gameUrl = readGameUrl();
 
-const app = await Spectrum({
+const spectrum = await Spectrum({
   projectId,
   projectSecret,
   providers: [
@@ -17,11 +18,42 @@ const app = await Spectrum({
 
 await printIMessageNumber(projectId, projectSecret);
 
-// `app.messages` is an async iterable. Each tick yields a `space` (the
+if (!gameUrl) {
+  console.warn(
+    "GAME_URL is unset or invalid. Inbound iMessage texts will not include the Midnight mini-app card.",
+  );
+}
+
+// `spectrum.messages` is an async iterable. Each tick yields a `space` (the
 // conversation) and an inbound `message`. Reply by awaiting `space.send(...)`.
-for await (const [space, message] of app.messages) {
-  if (message.content.type === "text") {
-    await space.send(`echo: ${message.content.text}`);
+for await (const [space, message] of spectrum.messages) {
+  if (message.direction === "outbound") continue;
+  if (message.content.type !== "text") continue;
+
+  await space.responding(async () => {
+    if (!gameUrl) {
+      await message.reply(
+        "Midnight isn't online yet. Set GAME_URL to the blackjack mini-app, then text me again.",
+      );
+      return;
+    }
+
+    await space.send(
+      "Mina is dealing at Midnight. Open the table to answer her call — say hit, stand, double, or deal.",
+      app(gameUrl, { live: true }),
+    );
+  });
+}
+
+function readGameUrl(): string | undefined {
+  const value = process.env.GAME_URL?.trim();
+  if (!value) return undefined;
+
+  try {
+    return new URL(value).toString();
+  } catch {
+    console.warn(`GAME_URL is not a valid absolute URL: ${value}`);
+    return undefined;
   }
 }
 
